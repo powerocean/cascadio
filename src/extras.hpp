@@ -348,3 +348,224 @@ static std::string injectBrepExtensionIntoJson(
 
   return std::string(buffer.GetString(), buffer.GetSize());
 }
+
+/// Modify JSON to add per-mesh edge lines as LINES primitives
+/// Each shape with edges provides vertex bytes, index bytes, and min/max bounds.
+/// edgeColor must be [R, G, B, A] in [0,1] range (default gray).
+static std::string injectEdgeLinesIntoJson(
+    const std::string &jsonString,
+    uint32_t existingBinLength,
+    const std::vector<uint32_t> &shapeVertBytes,
+    const std::vector<uint32_t> &shapeIdxBytes,
+    const std::vector<float> &shapeMinX,
+    const std::vector<float> &shapeMinY,
+    const std::vector<float> &shapeMinZ,
+    const std::vector<float> &shapeMaxX,
+    const std::vector<float> &shapeMaxY,
+    const std::vector<float> &shapeMaxZ,
+    const std::vector<float> &edgeColor = {0.25f, 0.25f, 0.25f, 1.0f}) {
+
+  rapidjson::Document doc;
+  doc.Parse(jsonString.c_str(), jsonString.size());
+  if (doc.HasParseError()) {
+    std::cerr << "Error: Failed to parse JSON for edge injection" << std::endl;
+    return jsonString;
+  }
+
+  // Validate input sizes
+  size_t numShapes = shapeVertBytes.size();
+  if (numShapes == 0) return jsonString;
+
+  // Build per-shape layout info
+  struct ShapeLayout {
+    uint32_t vertByteLength;
+    uint32_t idxByteLength;
+    int vertBufViewId;
+    int idxBufViewId;
+    int vertAccId;
+    int idxAccId;
+    float minX, minY, minZ, maxX, maxY, maxZ;
+  };
+  std::vector<ShapeLayout> layouts(numShapes);
+  uint32_t totalVertBytes = 0;
+  uint32_t totalIdxBytes = 0;
+  for (size_t i = 0; i < numShapes; i++) {
+    layouts[i].vertByteLength = shapeVertBytes[i];
+    layouts[i].idxByteLength = shapeIdxBytes[i];
+    layouts[i].vertBufViewId = layouts[i].idxBufViewId = 0;
+    layouts[i].vertAccId = layouts[i].idxAccId = 0;
+    layouts[i].minX = shapeMinX[i]; layouts[i].minY = shapeMinY[i]; layouts[i].minZ = shapeMinZ[i];
+    layouts[i].maxX = shapeMaxX[i]; layouts[i].maxY = shapeMaxY[i]; layouts[i].maxZ = shapeMaxZ[i];
+    totalVertBytes += layouts[i].vertByteLength;
+    totalIdxBytes += layouts[i].idxByteLength;
+  }
+  if (totalVertBytes == 0 || totalIdxBytes == 0) {
+    return jsonString;
+  }
+
+  // Buffer layout: [existing data] [padding] [all verts] [padding] [all indices]
+  uint32_t vertSectionBase = alignTo(existingBinLength);
+  uint32_t idxSectionBase = alignTo(vertSectionBase + totalVertBytes);
+  uint32_t newBinLength = alignTo(idxSectionBase + totalIdxBytes);
+
+  // Update buffers[0].byteLength
+  if (doc.HasMember("buffers") && doc["buffers"].IsArray() &&
+      doc["buffers"].Size() > 0 &&
+      doc["buffers"][0].HasMember("byteLength")) {
+    doc["buffers"][0]["byteLength"].SetUint(newBinLength);
+  }
+
+  // Compute per-shape buffer offsets within sections
+  uint32_t vertOffset = vertSectionBase;
+  uint32_t idxOffset = idxSectionBase;
+  for (size_t i = 0; i < layouts.size(); i++) {
+    auto &l = layouts[i];
+    if (l.vertByteLength == 0) continue;
+
+    // BufferView for this shape's edge vertices
+    l.vertBufViewId = doc.HasMember("bufferViews") && doc["bufferViews"].IsArray()
+        ? doc["bufferViews"].Size() : 0;
+    if (doc.HasMember("bufferViews")) {
+      rapidjson::Value bv(rapidjson::kObjectType);
+      bv.AddMember("buffer", 0, doc.GetAllocator());
+      bv.AddMember("byteOffset", vertOffset, doc.GetAllocator());
+      bv.AddMember("byteLength", l.vertByteLength, doc.GetAllocator());
+      doc["bufferViews"].PushBack(bv, doc.GetAllocator());
+    }
+
+    // BufferView for this shape's edge indices
+    l.idxBufViewId = doc.HasMember("bufferViews") && doc["bufferViews"].IsArray()
+        ? doc["bufferViews"].Size() : 0;
+    if (doc.HasMember("bufferViews")) {
+      rapidjson::Value bv(rapidjson::kObjectType);
+      bv.AddMember("buffer", 0, doc.GetAllocator());
+      bv.AddMember("byteOffset", idxOffset, doc.GetAllocator());
+      bv.AddMember("byteLength", l.idxByteLength, doc.GetAllocator());
+      doc["bufferViews"].PushBack(bv, doc.GetAllocator());
+    }
+
+    // Accessor for edge vertices (VEC3 float)
+    l.vertAccId = doc.HasMember("accessors") && doc["accessors"].IsArray()
+        ? doc["accessors"].Size() : 0;
+    if (doc.HasMember("accessors")) {
+      rapidjson::Value acc(rapidjson::kObjectType);
+      acc.AddMember("bufferView", static_cast<int>(l.vertBufViewId), doc.GetAllocator());
+      acc.AddMember("byteOffset", 0, doc.GetAllocator());
+      acc.AddMember("componentType", 5126, doc.GetAllocator()); // FLOAT
+      acc.AddMember("count", static_cast<int>(l.vertByteLength / (3 * sizeof(float))), doc.GetAllocator());
+      acc.AddMember("type", "VEC3", doc.GetAllocator());
+      rapidjson::Value minArr(rapidjson::kArrayType);
+      minArr.PushBack(l.minX, doc.GetAllocator())
+           .PushBack(l.minY, doc.GetAllocator())
+           .PushBack(l.minZ, doc.GetAllocator());
+      acc.AddMember("min", minArr, doc.GetAllocator());
+      rapidjson::Value maxArr(rapidjson::kArrayType);
+      maxArr.PushBack(l.maxX, doc.GetAllocator())
+           .PushBack(l.maxY, doc.GetAllocator())
+           .PushBack(l.maxZ, doc.GetAllocator());
+      acc.AddMember("max", maxArr, doc.GetAllocator());
+      doc["accessors"].PushBack(acc, doc.GetAllocator());
+    }
+
+    // Accessor for edge indices (SCALAR uint32)
+    l.idxAccId = doc.HasMember("accessors") && doc["accessors"].IsArray()
+        ? doc["accessors"].Size() : 0;
+    if (doc.HasMember("accessors")) {
+      rapidjson::Value acc(rapidjson::kObjectType);
+      acc.AddMember("bufferView", static_cast<int>(l.idxBufViewId), doc.GetAllocator());
+      acc.AddMember("byteOffset", 0, doc.GetAllocator());
+      acc.AddMember("componentType", 5125, doc.GetAllocator()); // UNSIGNED_INT
+      acc.AddMember("count", static_cast<int>(l.idxByteLength / sizeof(uint32_t)), doc.GetAllocator());
+      acc.AddMember("type", "SCALAR", doc.GetAllocator());
+      doc["accessors"].PushBack(acc, doc.GetAllocator());
+    }
+
+    vertOffset += l.vertByteLength;
+    idxOffset += l.idxByteLength;
+  }
+
+  // Build mapping from JSON mesh index to shape index using indices accessor IDs.
+  // Multiple JSON meshes may share the same indices accessor (mesh instancing).
+  // Accessor IDs are assigned in binary write order, so lower ID = lower callback meshIndex.
+  std::map<size_t, int> jsonMeshToShapeIdx;
+  if (doc.HasMember("meshes") && doc["meshes"].IsArray()) {
+    std::set<int> seenAccessorIds;
+    std::vector<std::pair<size_t, int>> meshAccessorPairs;
+    for (size_t i = 0; i < doc["meshes"].Size(); ++i) {
+      const auto* prim = getFirstPrimitive(doc["meshes"][i]);
+      if (prim && prim->HasMember("indices")) {
+        int accId = (*prim)["indices"].GetInt();
+        if (accId >= 0) {
+          seenAccessorIds.insert(accId);
+          meshAccessorPairs.emplace_back(i, accId);
+        }
+      }
+    }
+    std::map<int, int> accessorToShapeIdx;
+    int shapeIdx = 0;
+    for (int accId : seenAccessorIds) {
+      accessorToShapeIdx[accId] = shapeIdx++;
+    }
+    for (const auto& [mIdx, accId] : meshAccessorPairs) {
+      jsonMeshToShapeIdx[mIdx] = accessorToShapeIdx[accId];
+    }
+  }
+
+  // Create edge material with the specified color
+  int edgeMatId = -1;
+  {
+    rapidjson::Value mat(rapidjson::kObjectType);
+    rapidjson::Value pbr(rapidjson::kObjectType);
+    rapidjson::Value color(rapidjson::kArrayType);
+    float ecr = edgeColor.size() > 0 ? edgeColor[0] : 0.25f;
+    float ecg = edgeColor.size() > 1 ? edgeColor[1] : 0.25f;
+    float ecb = edgeColor.size() > 2 ? edgeColor[2] : 0.25f;
+    float eca = edgeColor.size() > 3 ? edgeColor[3] : 1.0f;
+    color.PushBack(ecr, doc.GetAllocator())
+        .PushBack(ecg, doc.GetAllocator())
+        .PushBack(ecb, doc.GetAllocator())
+        .PushBack(eca, doc.GetAllocator());
+    pbr.AddMember("baseColorFactor", color, doc.GetAllocator());
+    mat.AddMember("pbrMetallicRoughness", pbr, doc.GetAllocator());
+    mat.AddMember("doubleSided", true, doc.GetAllocator());
+
+    if (!doc.HasMember("materials") || !doc["materials"].IsArray()) {
+      rapidjson::Value arr(rapidjson::kArrayType);
+      arr.PushBack(mat, doc.GetAllocator());
+      doc.AddMember("materials", arr, doc.GetAllocator());
+      edgeMatId = 0;
+    } else {
+      edgeMatId = doc["materials"].Size();
+      doc["materials"].PushBack(mat, doc.GetAllocator());
+    }
+  }
+
+  // Add LINES primitive to each mesh using the correct shape mapping
+  for (size_t meshIdx = 0; meshIdx < doc["meshes"].Size(); ++meshIdx) {
+    auto siIt = jsonMeshToShapeIdx.find(meshIdx);
+    if (siIt == jsonMeshToShapeIdx.end()) continue;
+    int si = siIt->second;
+    if (si < 0 || (size_t)si >= layouts.size()) continue;
+    const auto &l = layouts[si];
+    if (l.vertByteLength == 0) continue;
+
+    auto &mesh = doc["meshes"][meshIdx];
+    if (!mesh.HasMember("primitives") || !mesh["primitives"].IsArray()) continue;
+
+    rapidjson::Value linePrim(rapidjson::kObjectType);
+    linePrim.AddMember("mode", 1, doc.GetAllocator()); // LINES
+    linePrim.AddMember("material", edgeMatId, doc.GetAllocator());
+    rapidjson::Value attrs(rapidjson::kObjectType);
+    attrs.AddMember("POSITION", static_cast<int>(l.vertAccId), doc.GetAllocator());
+    linePrim.AddMember("attributes", attrs, doc.GetAllocator());
+    linePrim.AddMember("indices", static_cast<int>(l.idxAccId), doc.GetAllocator());
+    mesh["primitives"].PushBack(linePrim, doc.GetAllocator());
+  }
+
+  // Serialize back to string
+  rapidjson::StringBuffer buffer;
+  rapidjson::Writer<rapidjson::StringBuffer> writer(buffer);
+  doc.Accept(writer);
+
+  return std::string(buffer.GetString(), buffer.GetSize());
+}
