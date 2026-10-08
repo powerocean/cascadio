@@ -23,6 +23,7 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 
 # Check if running inside cibuildwheel
 IN_CIBUILDWHEEL = os.environ.get("CIBUILDWHEEL") == "1"
@@ -177,10 +178,20 @@ def apply_patches(occt_src, patches_dir):
     print(f"Found {len(patches)} patch(es) to check...")
 
     patches_applied = False
+    normalized_patches = []
 
     for patch_path in patches:
         patch_name = os.path.basename(patch_path)
-        abs_patch_path = os.path.abspath(patch_path)
+
+        # The patched OCCT sources are pinned to LF by .gitattributes, while the
+        # patch file itself can be checked out with CRLF on Windows
+        # (core.autocrlf).  Normalize the hunks to LF so they match everywhere.
+        with open(patch_path, "rb") as patch_file:
+            patch_bytes = patch_file.read().replace(b"\r\n", b"\n")
+        with tempfile.NamedTemporaryFile("wb", suffix=".patch", delete=False) as tmp:
+            tmp.write(patch_bytes)
+            abs_patch_path = tmp.name
+        normalized_patches.append(abs_patch_path)
 
         # On Windows, check via git diff stat count; on Unix via patch --dry-run
         if platform.system() == "Windows":
@@ -212,6 +223,9 @@ def apply_patches(occt_src, patches_dir):
                 cwd=occt_src, check=True,
             )
         patches_applied = True
+
+    for temp_path in normalized_patches:
+        os.remove(temp_path)
 
     return patches_applied
 
@@ -302,9 +316,11 @@ def main():
         if os.path.isdir(cmake_files):
             shutil.rmtree(cmake_files)
 
-    # Apply patches (CMake will detect header changes and ninja will rebuild)
-    if not IN_CIBUILDWHEEL:
-        apply_patches(occt_src, patches_dir)
+    # Apply patches (CMake will detect header changes and ninja will rebuild).
+    # This must run in CI as well: the submodule is checked out pristine, and
+    # the RWGltf_CafWriter callbacks that the bindings compile against only
+    # exist once the patch has been applied.
+    apply_patches(occt_src, patches_dir)
 
     # Clean build if requested (removes CMake cache but keeps source changes)
     if args.clean:
