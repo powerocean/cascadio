@@ -10,6 +10,7 @@ from typing import Literal, Optional, Set, Tuple
 # Import the C extension functions and enums
 from cascadio._core import (
     FileType,
+    NodeNameFormat,
     to_glb_bytes,
     step_to_glb,
     step_to_obj,
@@ -18,9 +19,6 @@ from cascadio._core import (
 
 # Import primitives submodule
 from . import primitives
-
-# Import trimesh extension
-from . import extension
 
 # File type constants for convenience
 STEP = FileType.STEP
@@ -44,6 +42,7 @@ def load(
     include_materials: bool = False,
     include_edges: bool = False,
     edge_color: Tuple[float, float, float, float] = (0.25, 0.25, 0.25, 1.0),
+    node_name_format: NodeNameFormat = NodeNameFormat.INSTANCE_OR_PRODUCT,
 ) -> bytes:
     """
     Convert BREP data (STEP or IGES) to GLB format.
@@ -80,6 +79,10 @@ def load(
     edge_color : tuple of 4 floats, optional
         RGBA color for edge lines when include_edges=True.
         Each value in [0, 1]. Default is (0.25, 0.25, 0.25, 1.0) (gray).
+    node_name_format : NodeNameFormat, optional
+        Name format used for GLB nodes and meshes. Controls whether
+        instance names, product names, or both are used. Default is
+        NodeNameFormat.INSTANCE_OR_PRODUCT (OCCT's default).
 
     Returns
     -------
@@ -128,7 +131,17 @@ def load(
         include_materials=include_materials,
         include_edges=include_edges,
         edge_color=edge_color,
+        node_name_format=node_name_format,
     )
+
+
+def __getattr__(name: str):
+    """Lazy-load submodules on first access."""
+    if name == "extension":
+        import importlib
+        return importlib.import_module(".extension", __name__)
+    msg = f"module {__name__!r} has no attribute {name!r}"
+    raise AttributeError(msg)
 
 
 __all__ = [
@@ -141,5 +154,6 @@ __all__ = [
     "step_to_obj",
     "__version__",
     "primitives",
-    "trimesh_ext",
+    "extension",
+    "NodeNameFormat",
 ]

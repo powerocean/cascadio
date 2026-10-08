@@ -46,24 +46,37 @@ PLATFORM_LIB_NAME = {
     "Windows": "TKernel.dll",
 }
 
-CMAKE_ARGS = [
-    "-G",
-    "Ninja",
-    "-DCMAKE_BUILD_TYPE=Release",
-    "-DUSE_RAPIDJSON:BOOL=ON",
-    "-DUSE_OPENGL:BOOL=OFF",
-    "-DUSE_TK:BOOL=OFF",
-    "-DUSE_FREETYPE:BOOL=OFF",
-    "-DUSE_VTK:BOOL=OFF",
-    "-DUSE_XLIB:BOOL=OFF",
-    "-DUSE_GLES2:BOOL=OFF",
-    "-DUSE_OPENVR:BOOL=OFF",
-    "-DBUILD_Inspector:BOOL=OFF",
-    "-DUSE_FREEIMAGE:BOOL=OFF",
-    "-DBUILD_SAMPLES_QT:BOOL=OFF",
-    "-DBUILD_MODULE_Draw:BOOL=OFF",
-    "-DBUILD_MODULE_Visualization:BOOL=OFF",
-]
+def get_cmake_args():
+    """Get CMake arguments based on platform."""
+    system = platform.system()
+    if system == "Windows":
+        # Use MSVC via Visual Studio generator (Ninja on Windows picks MinGW)
+        generator = "Visual Studio 16 2019"
+    else:
+        generator = "Ninja"
+
+    args = [
+        "-G", generator,
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DUSE_RAPIDJSON:BOOL=ON",
+        "-DUSE_OPENGL:BOOL=OFF",
+        "-DUSE_TK:BOOL=OFF",
+        "-DUSE_FREETYPE:BOOL=OFF",
+        "-DUSE_VTK:BOOL=OFF",
+        "-DUSE_XLIB:BOOL=OFF",
+        "-DUSE_GLES2:BOOL=OFF",
+        "-DUSE_OPENVR:BOOL=OFF",
+        "-DBUILD_Inspector:BOOL=OFF",
+        "-DUSE_FREEIMAGE:BOOL=OFF",
+        "-DBUILD_SAMPLES_QT:BOOL=OFF",
+        "-DBUILD_MODULE_Draw:BOOL=OFF",
+        "-DBUILD_MODULE_Visualization:BOOL=OFF",
+    ]
+
+    if system == "Windows":
+        args.append("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL")
+
+    return args
 
 
 def run(cmd, **kwargs):
@@ -99,37 +112,40 @@ def apply_patches(occt_src, patches_dir):
     print(f"Found {len(patches)} patch(es) to check...")
 
     patches_applied = False
+
     for patch_path in patches:
         patch_name = os.path.basename(patch_path)
         abs_patch_path = os.path.abspath(patch_path)
 
-        # Check if patch is already applied by doing a dry-run reverse
-        result = subprocess.run(
-            [
-                "patch",
-                "-p1",
-                "--reverse",
-                "--dry-run",
-                "--force",
-                "--silent",
-                "-i",
-                abs_patch_path,
-            ],
-            cwd=occt_src,
-            capture_output=True,
-        )
-
-        if result.returncode == 0:
-            print(f"  {patch_name}: already applied")
-            continue
-
-        # Apply the patch (patch handles line ending conversion automatically)
-        print(f"  {patch_name}: applying...")
-        subprocess.run(
-            ["patch", "-p1", "-i", abs_patch_path],
-            cwd=occt_src,
-            check=True,
-        )
+        # On Windows, check via git diff stat count; on Unix via patch --dry-run
+        if platform.system() == "Windows":
+            # Count how many lines the patch touches (ignoring diff metadata)
+            diff_len = subprocess.run(
+                ["git", "diff", "--stat"],
+                cwd=occt_src,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            if diff_len:
+                print(f"  {patch_name}: detected working tree changes, skipping")
+                continue
+            print(f"  {patch_name}: applying...")
+            subprocess.run(
+                ["git", "-c", "core.autocrlf=false", "apply", abs_patch_path],
+                cwd=occt_src, check=True,
+            )
+        else:
+            result = subprocess.run(
+                ["patch", "-p1", "--binary", "--reverse", "--dry-run", "--force", "--silent", "-i", abs_patch_path],
+                cwd=occt_src, capture_output=True,
+            )
+            if result.returncode == 0:
+                print(f"  {patch_name}: already applied")
+                continue
+            print(f"  {patch_name}: applying...")
+            subprocess.run(
+                ["patch", "-p1", "--binary", "-i", abs_patch_path],
+                cwd=occt_src, check=True,
+            )
         patches_applied = True
 
     return patches_applied
@@ -210,8 +226,21 @@ def main():
 
     os.chdir(occt_src)
 
+    # In cibuildwheel, the project is copied from the host where OCCT was
+    # already configured/patched for Windows. Clean the CMake cache so it
+    # re-configures for the current container's platform.
+    if IN_CIBUILDWHEEL:
+        cmake_cache = os.path.join(occt_src, "CMakeCache.txt")
+        cmake_files = os.path.join(occt_src, "CMakeFiles")
+        if os.path.exists(cmake_cache):
+            os.remove(cmake_cache)
+        if os.path.isdir(cmake_files):
+            import shutil
+            shutil.rmtree(cmake_files)
+
     # Apply patches (CMake will detect header changes and ninja will rebuild)
-    apply_patches(occt_src, patches_dir)
+    if not IN_CIBUILDWHEEL:
+        apply_patches(occt_src, patches_dir)
 
     # Clean build if requested (removes CMake cache but keeps source changes)
     if args.clean:
@@ -229,7 +258,7 @@ def main():
             shutil.rmtree(cmake_files)
 
     # Build cmake args
-    cmake_args = CMAKE_ARGS.copy()
+    cmake_args = get_cmake_args()
 
     # RapidJSON path
     rapidjson_path = os.path.join(PROJECT_ROOT, "upstream", "rapidjson", "include")
@@ -256,13 +285,14 @@ def main():
             f.write(content)
         print("Patched build.ninja to remove GL/EGL")
 
-    # Build (ninja handles incremental builds automatically)
-    print("Building with ninja...")
-    run(["ninja"])
+    # Build
+    build_tool = "ninja" if system != "Windows" else "msbuild"
+    print(f"Building with {build_tool}...")
+    run(["cmake", "--build", ".", "--config", "Release"])
 
     # For local builds, also install to get libs in the cache dir
     if not IN_CIBUILDWHEEL:
-        run(["ninja", "install"])
+        run(["cmake", "--install", ".", "--config", "Release"])
         lib_dir = os.path.join(install_prefix, "lib")
         print("\nOCCT built successfully!")
         write_env_file(lib_dir)
