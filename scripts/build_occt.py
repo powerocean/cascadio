@@ -20,6 +20,7 @@ import argparse
 import glob
 import os
 import platform
+import shutil
 import subprocess
 import sys
 
@@ -46,12 +47,76 @@ PLATFORM_LIB_NAME = {
     "Windows": "TKernel.dll",
 }
 
+# CMake generator major version -> Visual Studio year.
+# Every runner/VS install ships exactly one VS version, so the generator name
+# (which embeds the year) has to be probed instead of hard-coded.
+VS_GENERATOR_YEARS = {
+    "18": "2026",
+    "17": "2022",
+    "16": "2019",
+    "15": "2017",
+}
+
+
+def msvc_is_on_path():
+    """True when an MSVC toolchain is already on PATH (vcvars / msvc-dev-cmd)."""
+    return shutil.which("cl") is not None
+
+
+def find_visual_studio_generator():
+    """Newest installed Visual Studio CMake generator, or None if undetected."""
+    vswhere = os.path.join(
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        "Microsoft Visual Studio",
+        "Installer",
+        "vswhere.exe",
+    )
+    installation_version = ""
+    if os.path.isfile(vswhere):
+        try:
+            installation_version = subprocess.run(
+                [vswhere, "-latest", "-products", "*", "-property", "installationVersion"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            installation_version = ""
+
+    major = installation_version.split(".")[0]
+    if major in VS_GENERATOR_YEARS:
+        return f"Visual Studio {major} {VS_GENERATOR_YEARS[major]}"
+
+    # vswhere missing: probe the default install roots, newest version first
+    for major in sorted(VS_GENERATOR_YEARS, key=int, reverse=True):
+        year = VS_GENERATOR_YEARS[major]
+        for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+            if base and os.path.isdir(os.path.join(base, "Microsoft Visual Studio", year)):
+                return f"Visual Studio {major} {year}"
+    return None
+
+
+def get_windows_generator():
+    """Pick a Windows generator that works both in CI and for local dev.
+
+    In CI ``ilammy/msvc-dev-cmd`` has already put MSVC on PATH, so plain
+    ``Ninja`` driving ``cl.exe`` is best: it is fastest and, unlike a
+    year-stamped Visual Studio generator, it does not care which VS version
+    the runner image ships.
+
+    Otherwise (local dev) prefer an installed Visual Studio generator, since a
+    bare Ninja would happily pick up a MinGW ``gcc`` when one is on PATH.
+    """
+    if msvc_is_on_path():
+        return "Ninja"
+    return find_visual_studio_generator() or "Ninja"
+
+
 def get_cmake_args():
     """Get CMake arguments based on platform."""
     system = platform.system()
     if system == "Windows":
-        # Use MSVC via Visual Studio generator (Ninja on Windows picks MinGW)
-        generator = "Visual Studio 16 2019"
+        generator = get_windows_generator()
     else:
         generator = "Ninja"
 
@@ -235,7 +300,6 @@ def main():
         if os.path.exists(cmake_cache):
             os.remove(cmake_cache)
         if os.path.isdir(cmake_files):
-            import shutil
             shutil.rmtree(cmake_files)
 
     # Apply patches (CMake will detect header changes and ninja will rebuild)
@@ -253,8 +317,6 @@ def main():
         if os.path.exists(build_ninja):
             os.remove(build_ninja)
         if os.path.isdir(cmake_files):
-            import shutil
-
             shutil.rmtree(cmake_files)
 
     # Build cmake args
