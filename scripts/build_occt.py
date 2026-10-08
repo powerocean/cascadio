@@ -20,8 +20,10 @@ import argparse
 import glob
 import os
 import platform
+import shutil
 import subprocess
 import sys
+import tempfile
 
 # Check if running inside cibuildwheel
 IN_CIBUILDWHEEL = os.environ.get("CIBUILDWHEEL") == "1"
@@ -46,24 +48,101 @@ PLATFORM_LIB_NAME = {
     "Windows": "TKernel.dll",
 }
 
-CMAKE_ARGS = [
-    "-G",
-    "Ninja",
-    "-DCMAKE_BUILD_TYPE=Release",
-    "-DUSE_RAPIDJSON:BOOL=ON",
-    "-DUSE_OPENGL:BOOL=OFF",
-    "-DUSE_TK:BOOL=OFF",
-    "-DUSE_FREETYPE:BOOL=OFF",
-    "-DUSE_VTK:BOOL=OFF",
-    "-DUSE_XLIB:BOOL=OFF",
-    "-DUSE_GLES2:BOOL=OFF",
-    "-DUSE_OPENVR:BOOL=OFF",
-    "-DBUILD_Inspector:BOOL=OFF",
-    "-DUSE_FREEIMAGE:BOOL=OFF",
-    "-DBUILD_SAMPLES_QT:BOOL=OFF",
-    "-DBUILD_MODULE_Draw:BOOL=OFF",
-    "-DBUILD_MODULE_Visualization:BOOL=OFF",
-]
+# CMake generator major version -> Visual Studio year.
+# Every runner/VS install ships exactly one VS version, so the generator name
+# (which embeds the year) has to be probed instead of hard-coded.
+VS_GENERATOR_YEARS = {
+    "18": "2026",
+    "17": "2022",
+    "16": "2019",
+    "15": "2017",
+}
+
+
+def msvc_is_on_path():
+    """True when an MSVC toolchain is already on PATH (vcvars / msvc-dev-cmd)."""
+    return shutil.which("cl") is not None
+
+
+def find_visual_studio_generator():
+    """Newest installed Visual Studio CMake generator, or None if undetected."""
+    vswhere = os.path.join(
+        os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        "Microsoft Visual Studio",
+        "Installer",
+        "vswhere.exe",
+    )
+    installation_version = ""
+    if os.path.isfile(vswhere):
+        try:
+            installation_version = subprocess.run(
+                [vswhere, "-latest", "-products", "*", "-property", "installationVersion"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+        except (OSError, subprocess.CalledProcessError):
+            installation_version = ""
+
+    major = installation_version.split(".")[0]
+    if major in VS_GENERATOR_YEARS:
+        return f"Visual Studio {major} {VS_GENERATOR_YEARS[major]}"
+
+    # vswhere missing: probe the default install roots, newest version first
+    for major in sorted(VS_GENERATOR_YEARS, key=int, reverse=True):
+        year = VS_GENERATOR_YEARS[major]
+        for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+            if base and os.path.isdir(os.path.join(base, "Microsoft Visual Studio", year)):
+                return f"Visual Studio {major} {year}"
+    return None
+
+
+def get_windows_generator():
+    """Pick a Windows generator that works both in CI and for local dev.
+
+    In CI ``ilammy/msvc-dev-cmd`` has already put MSVC on PATH, so plain
+    ``Ninja`` driving ``cl.exe`` is best: it is fastest and, unlike a
+    year-stamped Visual Studio generator, it does not care which VS version
+    the runner image ships.
+
+    Otherwise (local dev) prefer an installed Visual Studio generator, since a
+    bare Ninja would happily pick up a MinGW ``gcc`` when one is on PATH.
+    """
+    if msvc_is_on_path():
+        return "Ninja"
+    return find_visual_studio_generator() or "Ninja"
+
+
+def get_cmake_args():
+    """Get CMake arguments based on platform."""
+    system = platform.system()
+    if system == "Windows":
+        generator = get_windows_generator()
+    else:
+        generator = "Ninja"
+
+    args = [
+        "-G", generator,
+        "-DCMAKE_BUILD_TYPE=Release",
+        "-DUSE_RAPIDJSON:BOOL=ON",
+        "-DUSE_OPENGL:BOOL=OFF",
+        "-DUSE_TK:BOOL=OFF",
+        "-DUSE_FREETYPE:BOOL=OFF",
+        "-DUSE_VTK:BOOL=OFF",
+        "-DUSE_XLIB:BOOL=OFF",
+        "-DUSE_GLES2:BOOL=OFF",
+        "-DUSE_OPENVR:BOOL=OFF",
+        "-DBUILD_Inspector:BOOL=OFF",
+        "-DUSE_FREEIMAGE:BOOL=OFF",
+        "-DBUILD_SAMPLES_QT:BOOL=OFF",
+        "-DBUILD_MODULE_Draw:BOOL=OFF",
+        "-DBUILD_MODULE_Visualization:BOOL=OFF",
+    ]
+
+    if system == "Windows":
+        args.append("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreadedDLL")
+
+    return args
 
 
 def run(cmd, **kwargs):
@@ -99,38 +178,54 @@ def apply_patches(occt_src, patches_dir):
     print(f"Found {len(patches)} patch(es) to check...")
 
     patches_applied = False
+    normalized_patches = []
+
     for patch_path in patches:
         patch_name = os.path.basename(patch_path)
-        abs_patch_path = os.path.abspath(patch_path)
 
-        # Check if patch is already applied by doing a dry-run reverse
-        result = subprocess.run(
-            [
-                "patch",
-                "-p1",
-                "--reverse",
-                "--dry-run",
-                "--force",
-                "--silent",
-                "-i",
-                abs_patch_path,
-            ],
-            cwd=occt_src,
-            capture_output=True,
-        )
+        # The patched OCCT sources are pinned to LF by .gitattributes, while the
+        # patch file itself can be checked out with CRLF on Windows
+        # (core.autocrlf).  Normalize the hunks to LF so they match everywhere.
+        with open(patch_path, "rb") as patch_file:
+            patch_bytes = patch_file.read().replace(b"\r\n", b"\n")
+        with tempfile.NamedTemporaryFile("wb", suffix=".patch", delete=False) as tmp:
+            tmp.write(patch_bytes)
+            abs_patch_path = tmp.name
+        normalized_patches.append(abs_patch_path)
 
-        if result.returncode == 0:
-            print(f"  {patch_name}: already applied")
-            continue
-
-        # Apply the patch (patch handles line ending conversion automatically)
-        print(f"  {patch_name}: applying...")
-        subprocess.run(
-            ["patch", "-p1", "-i", abs_patch_path],
-            cwd=occt_src,
-            check=True,
-        )
+        # On Windows, check via git diff stat count; on Unix via patch --dry-run
+        if platform.system() == "Windows":
+            # Count how many lines the patch touches (ignoring diff metadata)
+            diff_len = subprocess.run(
+                ["git", "diff", "--stat"],
+                cwd=occt_src,
+                capture_output=True, text=True,
+            ).stdout.strip()
+            if diff_len:
+                print(f"  {patch_name}: detected working tree changes, skipping")
+                continue
+            print(f"  {patch_name}: applying...")
+            subprocess.run(
+                ["git", "-c", "core.autocrlf=false", "apply", abs_patch_path],
+                cwd=occt_src, check=True,
+            )
+        else:
+            result = subprocess.run(
+                ["patch", "-p1", "--binary", "--reverse", "--dry-run", "--force", "--silent", "-i", abs_patch_path],
+                cwd=occt_src, capture_output=True,
+            )
+            if result.returncode == 0:
+                print(f"  {patch_name}: already applied")
+                continue
+            print(f"  {patch_name}: applying...")
+            subprocess.run(
+                ["patch", "-p1", "--binary", "-i", abs_patch_path],
+                cwd=occt_src, check=True,
+            )
         patches_applied = True
+
+    for temp_path in normalized_patches:
+        os.remove(temp_path)
 
     return patches_applied
 
@@ -210,7 +305,21 @@ def main():
 
     os.chdir(occt_src)
 
-    # Apply patches (CMake will detect header changes and ninja will rebuild)
+    # In cibuildwheel, the project is copied from the host where OCCT was
+    # already configured/patched for Windows. Clean the CMake cache so it
+    # re-configures for the current container's platform.
+    if IN_CIBUILDWHEEL:
+        cmake_cache = os.path.join(occt_src, "CMakeCache.txt")
+        cmake_files = os.path.join(occt_src, "CMakeFiles")
+        if os.path.exists(cmake_cache):
+            os.remove(cmake_cache)
+        if os.path.isdir(cmake_files):
+            shutil.rmtree(cmake_files)
+
+    # Apply patches (CMake will detect header changes and ninja will rebuild).
+    # This must run in CI as well: the submodule is checked out pristine, and
+    # the RWGltf_CafWriter callbacks that the bindings compile against only
+    # exist once the patch has been applied.
     apply_patches(occt_src, patches_dir)
 
     # Clean build if requested (removes CMake cache but keeps source changes)
@@ -224,12 +333,10 @@ def main():
         if os.path.exists(build_ninja):
             os.remove(build_ninja)
         if os.path.isdir(cmake_files):
-            import shutil
-
             shutil.rmtree(cmake_files)
 
     # Build cmake args
-    cmake_args = CMAKE_ARGS.copy()
+    cmake_args = get_cmake_args()
 
     # RapidJSON path
     rapidjson_path = os.path.join(PROJECT_ROOT, "upstream", "rapidjson", "include")
@@ -256,13 +363,14 @@ def main():
             f.write(content)
         print("Patched build.ninja to remove GL/EGL")
 
-    # Build (ninja handles incremental builds automatically)
-    print("Building with ninja...")
-    run(["ninja"])
+    # Build
+    build_tool = "ninja" if system != "Windows" else "msbuild"
+    print(f"Building with {build_tool}...")
+    run(["cmake", "--build", ".", "--config", "Release"])
 
     # For local builds, also install to get libs in the cache dir
     if not IN_CIBUILDWHEEL:
-        run(["ninja", "install"])
+        run(["cmake", "--install", ".", "--config", "Release"])
         lib_dir = os.path.join(install_prefix, "lib")
         print("\nOCCT built successfully!")
         write_env_file(lib_dir)

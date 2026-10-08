@@ -16,6 +16,7 @@
 #include <rapidjson/writer.h>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 // ============================================================================
@@ -486,24 +487,48 @@ static std::string injectEdgeLinesIntoJson(
 
   // Build mapping from JSON mesh index to shape index using indices accessor IDs.
   // Multiple JSON meshes may share the same indices accessor (mesh instancing).
-  // Accessor IDs are assigned in binary write order, so lower ID = lower callback meshIndex.
+  // Accessor IDs reflect the order RWGltf_CafWriter processed shapes (document traversal order).
+  //
+  // CRITICAL — Two invariants that MUST hold:
+  // 1. Use insertion order (first-occurrence), NOT sorted order. std::set sorts by value,
+  //    which would break alignment with perShapeEdges (built from XCAF document explorer).
+  // 2. Skip face-less (LINES-only) meshes. RWGltf_CafWriter creates meshes for 1D
+  //    topology (edges/curves without faces), but perShapeEdges only contains face-having
+  //    shapes (matched by the TopAbs_FACE check in convert.hpp). Including those accessor
+  //    IDs shifts the mapping and causes wrong edge attachment for subsequent face meshes.
   std::map<size_t, int> jsonMeshToShapeIdx;
   if (doc.HasMember("meshes") && doc["meshes"].IsArray()) {
-    std::set<int> seenAccessorIds;
+    std::vector<int> seenAccessorIds;       // preserves insertion (= traversal) order
+    std::unordered_set<int> seenAccSet;      // O(1) duplicate check
     std::vector<std::pair<size_t, int>> meshAccessorPairs;
     for (size_t i = 0; i < doc["meshes"].Size(); ++i) {
-      const auto* prim = getFirstPrimitive(doc["meshes"][i]);
+      const auto& mesh = doc["meshes"][i];
+      // Skip face-less meshes (LINES-only) — RWGltf_CafWriter generates these for
+      // 1D topology that has no faces, and perShapeEdges excludes such shapes.
+      bool hasTriangles = false;
+      if (mesh.HasMember("primitives") && mesh["primitives"].IsArray()) {
+        for (const auto& prim : mesh["primitives"].GetArray()) {
+          int mode = prim.HasMember("mode") ? prim["mode"].GetInt() : 4;
+          if (mode == 4) { hasTriangles = true; break; }
+        }
+      }
+      if (!hasTriangles) continue;
+
+      const auto* prim = getFirstPrimitive(mesh);
       if (prim && prim->HasMember("indices")) {
         int accId = (*prim)["indices"].GetInt();
         if (accId >= 0) {
-          seenAccessorIds.insert(accId);
+          if (seenAccSet.find(accId) == seenAccSet.end()) {
+            seenAccSet.insert(accId);
+            seenAccessorIds.push_back(accId);
+          }
           meshAccessorPairs.emplace_back(i, accId);
         }
       }
     }
     std::map<int, int> accessorToShapeIdx;
     int shapeIdx = 0;
-    for (int accId : seenAccessorIds) {
+    for (int accId : seenAccessorIds) {     // iterate in insertion order
       accessorToShapeIdx[accId] = shapeIdx++;
     }
     for (const auto& [mIdx, accId] : meshAccessorPairs) {
